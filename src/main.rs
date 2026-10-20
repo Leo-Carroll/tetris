@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 const COLS: usize = 10;
 const ROWS: usize = 20;
+const LOCK_DELAY: f32 = 0.5;
+const MAX_LOCK_RESETS: u8 = 15;
 
 const COLORS: [Color; 7] = [
     Color::new(0.20, 0.85, 0.95, 1.0),
@@ -248,6 +250,7 @@ struct Game {
     level: u32,
     fall_timer: f32,
     lock_timer: f32,
+    lock_resets: u8,
     state: State,
     clear_flash: Vec<(usize, f32)>,
     das: f32,
@@ -346,6 +349,7 @@ impl Game {
             level: 1,
             fall_timer: 0.0,
             lock_timer: 0.0,
+            lock_resets: 0,
             state: State::Playing,
             clear_flash: vec![],
             das: 0.0,
@@ -386,6 +390,19 @@ impl Game {
         })
     }
 
+    fn is_grounded(&self) -> bool {
+        let mut below = self.cur.clone();
+        below.y += 1;
+        !self.valid(&below)
+    }
+
+    fn reset_lock_delay(&mut self, was_grounded: bool) {
+        if was_grounded && self.lock_resets < MAX_LOCK_RESETS {
+            self.lock_timer = 0.0;
+            self.lock_resets += 1;
+        }
+    }
+
     fn try_move(&mut self, dx: i32, dy: i32) -> bool {
         let mut p = self.cur.clone();
         p.x += dx;
@@ -398,10 +415,20 @@ impl Game {
         }
     }
 
+    fn try_move_sideways(&mut self, dx: i32) -> bool {
+        let was_grounded = self.is_grounded();
+        let moved = self.try_move(dx, 0);
+        if moved {
+            self.reset_lock_delay(was_grounded);
+        }
+        moved
+    }
+
     fn rotate(&mut self, cw: bool) {
         if self.cur.kind == 1 {
             return;
         }
+        let was_grounded = self.is_grounded();
         let mut p = self.cur.clone();
         p.shape = if cw { rotate_cw(&p.shape) } else { rotate_ccw(&p.shape) };
         for (dx, dy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (-2, 0), (2, 0), (-1, -1), (1, -1)] {
@@ -410,7 +437,7 @@ impl Game {
             q.y += dy;
             if self.valid(&q) {
                 self.cur = q;
-                self.lock_timer = 0.0;
+                self.reset_lock_delay(was_grounded);
                 return;
             }
         }
@@ -438,6 +465,10 @@ impl Game {
         self.can_hold = false;
         self.fall_timer = 0.0;
         self.lock_timer = 0.0;
+        self.lock_resets = 0;
+        if !self.valid(&self.cur) {
+            self.state = State::GameOver;
+        }
     }
 
     fn lock(&mut self) {
@@ -484,6 +515,7 @@ impl Game {
         }
         self.can_hold = true;
         self.lock_timer = 0.0;
+        self.lock_resets = 0;
         self.fall_timer = 0.0;
         let n = self.pop_next();
         self.cur = Piece::new(n);
@@ -528,11 +560,11 @@ impl Game {
         self.clear_flash.retain(|f| f.1 > 0.0);
 
         if is_key_pressed(KeyCode::Left) || is_key_pressed(KeyCode::A) {
-            self.try_move(-1, 0);
+            self.try_move_sideways(-1);
             self.das = -0.17;
         }
         if is_key_pressed(KeyCode::Right) || is_key_pressed(KeyCode::D) {
-            self.try_move(1, 0);
+            self.try_move_sideways(1);
             self.das = -0.17;
         }
         let dir = (is_key_down(KeyCode::Right) || is_key_down(KeyCode::D)) as i32
@@ -541,7 +573,7 @@ impl Game {
             self.das += dt;
             while self.das >= 0.05 {
                 self.das -= 0.05;
-                self.try_move(dir, 0);
+                self.try_move_sideways(dir);
             }
         }
         if is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::X) || is_key_pressed(KeyCode::W) {
@@ -552,6 +584,9 @@ impl Game {
         }
         if is_key_pressed(KeyCode::C) || is_key_pressed(KeyCode::LeftShift) {
             self.hold_piece();
+            if self.state == State::GameOver {
+                return;
+            }
         }
         if is_key_pressed(KeyCode::Space) {
             self.hard_drop();
@@ -576,7 +611,7 @@ impl Game {
         grounded.y += 1;
         if !self.valid(&grounded) {
             self.lock_timer += dt;
-            if self.lock_timer >= 0.5 {
+            if self.lock_timer >= LOCK_DELAY {
                 self.lock();
             }
         } else {
@@ -741,6 +776,26 @@ fn draw_game(g: &Game, glow_texture: &Texture2D) {
                 draw_block(px, py, cell, col);
             }
         }
+        if g.is_grounded() {
+            let mut cells = g.cur.cells().filter(|(_, y)| *y >= 0);
+            if let Some((first_x, first_y)) = cells.next() {
+                let (min_x, max_x, max_y) = cells.fold(
+                    (first_x, first_x, first_y),
+                    |(min_x, max_x, max_y), (x, y)| (min_x.min(x), max_x.max(x), max_y.max(y)),
+                );
+                let bar_x = bx + min_x as f32 * cell;
+                let bar_y = by + (max_y + 1) as f32 * cell - 4.0;
+                let bar_w = (max_x - min_x + 1) as f32 * cell;
+                draw_rectangle(bar_x, bar_y, bar_w, 4.0, Color::new(0.15, 0.17, 0.22, 0.95));
+                draw_rectangle(
+                    bar_x,
+                    bar_y,
+                    bar_w * (g.lock_timer / LOCK_DELAY).clamp(0.0, 1.0),
+                    4.0,
+                    Color::new(1.0, 0.35, 0.25, 1.0),
+                );
+            }
+        }
     }
 
     for t in &g.trails {
@@ -842,6 +897,7 @@ fn draw_game(g: &Game, glow_texture: &Texture2D) {
             "C  Hold",
             "P  Pause",
             "Hold Esc  Menu",
+            "Ground bar  Lock timer",
         ];
         for (i, l) in lines.iter().enumerate() {
             draw_text(&l.replace('←', "<").replace('→', ">").replace('↑', "^").replace('↓', "v"), lx + cell * 0.4, cy + title * 3.2 + i as f32 * small * 1.6, small, TEXT);
@@ -1121,3 +1177,56 @@ pub const TETROMINOES: [[[bool; 4]; 4]; 7] = [
         [false, false, false, false],
     ],
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_game() -> Game {
+        Game::new(0, None, GameMode::Infinite)
+    }
+
+    fn ground_active_piece(game: &mut Game) {
+        game.board[ROWS - 1] = [Some(0); COLS];
+        while game.try_move(0, 1) {}
+        assert!(game.is_grounded());
+    }
+
+    #[test]
+    fn holding_piece_with_blocked_spawn_ends_game() {
+        let mut game = new_game();
+        game.hold = Some(0);
+        game.board[0][3] = Some(1);
+
+        game.hold_piece();
+
+        assert!(game.state == State::GameOver);
+        assert_eq!(game.cur.kind, 0);
+        assert!(!game.can_hold);
+    }
+
+    #[test]
+    fn grounded_sideways_move_resets_lock_delay() {
+        let mut game = new_game();
+        ground_active_piece(&mut game);
+        game.lock_timer = LOCK_DELAY * 0.8;
+
+        assert!(game.try_move_sideways(1));
+
+        assert_eq!(game.lock_timer, 0.0);
+        assert_eq!(game.lock_resets, 1);
+    }
+
+    #[test]
+    fn grounded_sideways_move_respects_lock_reset_cap() {
+        let mut game = new_game();
+        ground_active_piece(&mut game);
+        game.lock_timer = LOCK_DELAY * 0.8;
+        game.lock_resets = MAX_LOCK_RESETS;
+
+        assert!(game.try_move_sideways(1));
+
+        assert_eq!(game.lock_timer, LOCK_DELAY * 0.8);
+        assert_eq!(game.lock_resets, MAX_LOCK_RESETS);
+    }
+}
